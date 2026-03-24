@@ -159,10 +159,21 @@ jobs:
           key: ${{ matrix.target }}${{ matrix.compat && '-compat' || '' }}
 
       - name: Set up sccache (Shelby)
+        if: '!matrix.container'
         uses: gregnazario/shelby-sccache/action@main
         with:
           aptos-private-key: ${{ secrets.APTOS_PRIVATE_KEY }}
           shelby-api-key: ${{ secrets.SHELBY_API_KEY }}
+
+      - name: Verify sccache proxy
+        if: '!matrix.container'
+        run: |
+          if curl -sf http://localhost:9000/ > /dev/null 2>&1; then
+            echo "Shelby proxy is running on port 9000"
+          else
+            echo "::warning::Shelby proxy not responding, disabling sccache"
+            echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          fi
 
       # ── Compat build configuration ────────────────────────────────
       - name: Patch .cargo/config.toml for compat (x86)
