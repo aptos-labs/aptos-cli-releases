@@ -1,0 +1,323 @@
+name: Release
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. aptos-cli-v9.0.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  # Job 1: Resolve the tag and check whether we need to build
+  # ────────────────────────────────────────────────────────────────────
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve tag and check for existing release
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            # Find the latest aptos-cli-v* release from aptos-core
+            TAG=$(gh api repos/aptos-labs/aptos-core/releases --paginate \
+              --jq '[.[] | select(.tag_name | startswith("aptos-cli-v"))][0].tag_name')
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              echo "No aptos-cli release found upstream"
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          VERSION="${TAG#aptos-cli-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Skip if we already published this release
+          if gh release view "$TAG" --repo "$GH_REPO" &>/dev/null; then
+            echo "Release $TAG already exists, skipping"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Will build $TAG (version $VERSION)"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ────────────────────────────────────────────────────────────────────
+  # Job 2: Build the CLI for every platform
+  # ────────────────────────────────────────────────────────────────────
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS x86
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macOS ARM
+            runner: macos-latest
+            target: aarch64-apple-darwin
+          - name: Linux x86
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - name: Linux ARM
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: Linux x86 compat
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            compat: true
+            container: ubuntu:20.04
+          - name: Linux ARM compat
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            compat: true
+            container: ubuntu:20.04
+
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || '' }}
+
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+
+    steps:
+      # ── Container prerequisites (compat builds only) ──────────────
+      - name: Install container prerequisites
+        if: matrix.container
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y curl ca-certificates git sudo
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # ── Checkout ──────────────────────────────────────────────────
+      - name: Checkout release repo
+        uses: actions/checkout@v4
+
+      - name: Checkout aptos-core
+        uses: actions/checkout@v4
+        with:
+          repository: aptos-labs/aptos-core
+          ref: ${{ needs.check.outputs.tag }}
+          path: aptos-core
+          fetch-depth: 1
+
+      # ── System dependencies ───────────────────────────────────────
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: bash .github/workflows/build-scripts/setup-linux.sh
+
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config openssl cmake llvm lld
+          OPENSSL_PREFIX="$(brew --prefix openssl)"
+          echo "OPENSSL_DIR=${OPENSSL_PREFIX}" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${OPENSSL_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
+
+      # ── Rust toolchain ────────────────────────────────────────────
+      - name: Read Rust toolchain version
+        id: rust-version
+        run: |
+          CHANNEL=$(grep '^channel' aptos-core/rust-toolchain.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "Using Rust toolchain: $CHANNEL"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust-version.outputs.channel }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aptos-core -> target
+          key: ${{ matrix.target }}${{ matrix.compat && '-compat' || '' }}
+
+      # ── Compat build configuration ────────────────────────────────
+      - name: Patch .cargo/config.toml for compat (x86)
+        if: matrix.compat && matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cd aptos-core
+          # Rust target-cpu: v3 → v2 (rustc supports this on all versions)
+          sed -i 's/target-cpu=x86-64-v3/target-cpu=x86-64-v2/g' .cargo/config.toml
+          # C compiler -march: v3 → baseline (Clang 10 in ubuntu:20.04 doesn't know v2 syntax)
+          sed -i 's/-march=x86-64-v3/-march=x86-64/g' .cargo/config.toml
+          echo "Patched .cargo/config.toml for x86-64-v2 compat"
+
+      # ── Build ─────────────────────────────────────────────────────
+      - name: Build
+        working-directory: aptos-core
+        run: cargo build -p aptos --profile cli
+
+      # ── Package ───────────────────────────────────────────────────
+      - name: Package binary
+        env:
+          COMPAT: ${{ matrix.compat }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          SUFFIX=""
+          if [ "$COMPAT" = "true" ]; then
+            SUFFIX="-compat"
+          fi
+          ARCHIVE="aptos-cli-${VERSION}-${TARGET}${SUFFIX}.zip"
+          cd aptos-core/target/cli
+          zip "${GITHUB_WORKSPACE}/${ARCHIVE}" aptos
+          echo "Packaged: ${ARCHIVE}"
+
+      # ── Upload artifact ───────────────────────────────────────────
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aptos-cli-${{ matrix.target }}${{ matrix.compat && '-compat' || '' }}
+          path: '*.zip'
+
+  # ────────────────────────────────────────────────────────────────────
+  # Job 3: Create the GitHub Release with all artifacts
+  # ────────────────────────────────────────────────────────────────────
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - name: Checkout release repo
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: artifacts
+        run: sha256sum aptos-cli-*.zip > SHA256SUMS
+
+      - name: Fetch changelog from aptos-core
+        run: |
+          # Download the CHANGELOG from the tagged version of aptos-core
+          curl -fsSL "https://raw.githubusercontent.com/aptos-labs/aptos-core/${TAG}/crates/aptos/CHANGELOG.md" \
+            -o CHANGELOG.md
+
+          # Extract the section for this version (between ## [VERSION] and the next ## [)
+          awk -v ver="$VERSION" '
+            /^## \[/ {
+              if (found) exit
+              if (index($0, "[" ver "]")) found=1
+            }
+            found { print }
+          ' CHANGELOG.md > release_notes_section.md
+
+          # If we found a section, use it; otherwise note it was not found
+          if [ -s release_notes_section.md ]; then
+            echo "Extracted changelog for version $VERSION"
+          else
+            echo "No changelog section found for version $VERSION"
+            echo "_No changelog entry found for this version._" > release_notes_section.md
+          fi
+
+      - name: Build release body
+        run: |
+          cat > release_body.md << 'HEADER'
+          ## Aptos CLI ${{ needs.check.outputs.version }}
+
+          Built from [aptos-core `${{ needs.check.outputs.tag }}`](https://github.com/aptos-labs/aptos-core/releases/tag/${{ needs.check.outputs.tag }}).
+
+          ### What's Changed
+
+          HEADER
+
+          cat release_notes_section.md >> release_body.md
+
+          # Add checksums table
+          cat >> release_body.md << 'TABLE_HEADER'
+
+          ### Downloads
+
+          | Platform | Archive | SHA-256 |
+          |----------|---------|---------|
+          TABLE_HEADER
+
+          # Generate table rows with checksums
+          cd artifacts
+          for zip in aptos-cli-*.zip; do
+            HASH=$(sha256sum "$zip" | cut -d' ' -f1)
+            SHORT_HASH="${HASH:0:16}..."
+            case "$zip" in
+              *x86_64-apple-darwin*)      PLATFORM="macOS x86_64" ;;
+              *aarch64-apple-darwin*)     PLATFORM="macOS ARM64" ;;
+              *x86_64*linux*compat*)      PLATFORM="Linux x86_64 (compat, GLIBC 2.31+)" ;;
+              *aarch64*linux*compat*)     PLATFORM="Linux ARM64 (compat, GLIBC 2.31+)" ;;
+              *x86_64*linux*)             PLATFORM="Linux x86_64" ;;
+              *aarch64*linux*)            PLATFORM="Linux ARM64" ;;
+              *)                          PLATFORM="$zip" ;;
+            esac
+            echo "| $PLATFORM | \`$zip\` | \`$SHORT_HASH\` |" >> ../release_body.md
+          done
+
+          cat >> ../release_body.md << 'FOOTER'
+
+          ### Verification
+
+          ```bash
+          sha256sum -c SHA256SUMS
+          ```
+          FOOTER
+
+      - name: Determine pre-release status
+        id: prerelease
+        run: |
+          if echo "$TAG" | grep -qE '-(rc|beta|alpha)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: Aptos CLI ${{ needs.check.outputs.version }}
+          prerelease: ${{ steps.prerelease.outputs.prerelease == 'true' }}
+          body_path: release_body.md
+          files: |
+            artifacts/aptos-cli-*.zip
+            artifacts/SHA256SUMS
+
+      - name: Update CHANGELOG in this repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          if ! git diff --cached --quiet; then
+            git commit -m "Update CHANGELOG from aptos-core ${TAG}"
+            git push
+          else
+            echo "CHANGELOG.md unchanged, skipping commit"
+          fi
