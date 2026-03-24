@@ -158,13 +158,11 @@ jobs:
           workspaces: aptos-core -> target
           key: ${{ matrix.target }}${{ matrix.compat && '-compat' || '' }}
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.7
-
-      - name: Configure sccache
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+      - name: Set up sccache (Shelby)
+        uses: gregnazario/shelby-sccache/action@main
+        with:
+          aptos-private-key: ${{ secrets.SHELBY_APTOS_PRIVATE_KEY }}
+          shelby-api-key: ${{ secrets.SHELBY_API_KEY }}
 
       # ── Compat build configuration ────────────────────────────────
       - name: Patch .cargo/config.toml for compat (x86)
