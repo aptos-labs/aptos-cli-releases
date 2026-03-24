@@ -161,7 +161,7 @@ jobs:
       - name: Set up sccache (Shelby)
         uses: gregnazario/shelby-sccache/action@main
         with:
-          aptos-private-key: ${{ secrets.SHELBY_APTOS_PRIVATE_KEY }}
+          aptos-private-key: ${{ secrets.APTOS_PRIVATE_KEY }}
           shelby-api-key: ${{ secrets.SHELBY_API_KEY }}
 
       # ── Compat build configuration ────────────────────────────────
