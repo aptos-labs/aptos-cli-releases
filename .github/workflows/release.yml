@@ -40,7 +40,7 @@ jobs:
             TAG="$INPUT_TAG"
           else
             # Find the latest aptos-cli-v* release from aptos-core
-            TAG=$(gh api repos/aptos-labs/aptos-core/releases --paginate \
+            TAG=$(gh api repos/aptos-labs/aptos-core/releases \
               --jq '[.[] | select(.tag_name | startswith("aptos-cli-v"))][0].tag_name')
             if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
               echo "No aptos-cli release found upstream"
