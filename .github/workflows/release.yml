@@ -9,6 +9,11 @@ on:
         description: 'Tag to build (e.g. aptos-cli-v9.0.0)'
         required: false
         type: string
+      backfill:
+        description: 'Backfill: build Windows artifacts for an existing release without recreating it'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -20,7 +25,7 @@ env:
 
 jobs:
   # ────────────────────────────────────────────────────────────────────
-  # Job 1: Resolve the tag and check whether we need to build
+  # Job 1: Resolve the tag, decide whether to build, and emit the matrix
   # ────────────────────────────────────────────────────────────────────
   check:
     runs-on: ubuntu-latest
@@ -28,14 +33,20 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
       should_build: ${{ steps.resolve.outputs.should_build }}
+      backfill: ${{ steps.resolve.outputs.backfill }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
     steps:
-      - name: Resolve tag and check for existing release
+      - name: Resolve tag, mode, and matrix
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
+          INPUT_BACKFILL: ${{ inputs.backfill }}
           GH_REPO: ${{ github.repository }}
         run: |
+          set -euo pipefail
+          BACKFILL="${INPUT_BACKFILL:-false}"
+
           if [ -n "$INPUT_TAG" ]; then
             TAG="$INPUT_TAG"
           else
@@ -50,20 +61,58 @@ jobs:
           fi
 
           VERSION="${TAG#aptos-cli-v}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"           >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION"   >> "$GITHUB_OUTPUT"
+          echo "backfill=$BACKFILL" >> "$GITHUB_OUTPUT"
+
+          # Full matrix used for fresh releases.
+          FULL_MATRIX=$(cat <<'JSON'
+          [
+            {"name":"macOS x86",        "runner":"macos-15-intel",   "target":"x86_64-apple-darwin"},
+            {"name":"macOS ARM",        "runner":"macos-latest",     "target":"aarch64-apple-darwin"},
+            {"name":"Linux x86",        "runner":"ubuntu-24.04",     "target":"x86_64-unknown-linux-gnu"},
+            {"name":"Linux ARM",        "runner":"ubuntu-24.04-arm", "target":"aarch64-unknown-linux-gnu"},
+            {"name":"Linux x86 compat", "runner":"ubuntu-latest",    "target":"x86_64-unknown-linux-gnu",  "compat":true, "container":"ubuntu:20.04"},
+            {"name":"Linux ARM compat", "runner":"ubuntu-24.04-arm", "target":"aarch64-unknown-linux-gnu", "compat":true, "container":"ubuntu:20.04"},
+            {"name":"Windows x86",      "runner":"windows-2025",     "target":"x86_64-pc-windows-msvc"}
+          ]
+          JSON
+          )
+
+          # Backfill matrix: only Windows targets.
+          BACKFILL_MATRIX=$(cat <<'JSON'
+          [
+            {"name":"Windows x86", "runner":"windows-2025", "target":"x86_64-pc-windows-msvc"}
+          ]
+          JSON
+          )
+
+          if [ "$BACKFILL" = "true" ]; then
+            # Verify the release exists; backfill only makes sense for an existing release.
+            if ! gh release view "$TAG" --repo "$GH_REPO" &>/dev/null; then
+              echo "::error::Backfill requested but release $TAG does not exist"
+              exit 1
+            fi
+            echo "Backfilling Windows artifacts for $TAG"
+            MATRIX=$(echo "$BACKFILL_MATRIX" | jq -c .)
+            echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Skip if we already published this release
           if gh release view "$TAG" --repo "$GH_REPO" &>/dev/null; then
-            echo "Release $TAG already exists, skipping"
+            echo "Release $TAG already exists, skipping (use backfill=true to add Windows artifacts)"
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
             echo "Will build $TAG (version $VERSION)"
+            MATRIX=$(echo "$FULL_MATRIX" | jq -c .)
+            echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
             echo "should_build=true" >> "$GITHUB_OUTPUT"
           fi
 
   # ────────────────────────────────────────────────────────────────────
-  # Job 2: Build the CLI for every platform
+  # Job 2: Build the CLI for every selected platform
   # ────────────────────────────────────────────────────────────────────
   build:
     needs: check
@@ -72,29 +121,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: macOS x86
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - name: macOS ARM
-            runner: macos-latest
-            target: aarch64-apple-darwin
-          - name: Linux x86
-            runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - name: Linux ARM
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - name: Linux x86 compat
-            runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            compat: true
-            container: ubuntu:20.04
-          - name: Linux ARM compat
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            compat: true
-            container: ubuntu:20.04
+        include: ${{ fromJSON(needs.check.outputs.matrix) }}
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
@@ -113,6 +140,12 @@ jobs:
           apt-get update
           apt-get install -y curl ca-certificates git sudo
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # ── Windows long-path support (aptos-core has very deep paths) ─
+      - name: Enable Windows long paths
+        if: runner.os == 'Windows'
+        shell: bash
+        run: git config --global core.longpaths true
 
       # ── Checkout ──────────────────────────────────────────────────
       - name: Checkout release repo
@@ -139,9 +172,22 @@ jobs:
           echo "OPENSSL_DIR=${OPENSSL_PREFIX}" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_PATH=${OPENSSL_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
 
+      - name: Install Windows build deps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # vcpkg is preinstalled on GitHub-hosted Windows runners at C:\vcpkg.
+          # Match aptos-core's own Windows release script.
+          $env:VCPKG_ROOT = 'C:\vcpkg\'
+          vcpkg install openssl:x64-windows-static-md --clean-after-build
+          "VCPKG_ROOT=C:\vcpkg\"                               | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENSSL_DIR=C:\vcpkg\installed\x64-windows-static-md" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "OPENSSL_STATIC=1"                                   | Out-File -FilePath $env:GITHUB_ENV -Append
+
       # ── Rust toolchain ────────────────────────────────────────────
       - name: Read Rust toolchain version
         id: rust-version
+        shell: bash
         run: |
           CHANNEL=$(grep '^channel' aptos-core/rust-toolchain.toml | sed 's/.*"\(.*\)"/\1/')
           echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
@@ -151,6 +197,7 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.rust-version.outputs.channel }}
+          targets: ${{ matrix.target }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -159,14 +206,14 @@ jobs:
           key: ${{ matrix.target }}${{ matrix.compat && '-compat' || '' }}
 
       - name: Set up sccache (Shelby)
-        if: '!matrix.container'
+        if: '!matrix.container && runner.os != ''Windows'''
         uses: gregnazario/shelby-sccache/action@main
         with:
           aptos-private-key: ${{ secrets.APTOS_PRIVATE_KEY }}
           shelby-api-key: ${{ secrets.SHELBY_API_KEY }}
 
       - name: Verify sccache proxy
-        if: '!matrix.container'
+        if: '!matrix.container && runner.os != ''Windows'''
         run: |
           if curl -sf http://localhost:9000/ > /dev/null 2>&1; then
             echo "Shelby proxy is running on port 9000"
@@ -192,7 +239,8 @@ jobs:
         run: cargo build -p aptos --profile cli
 
       # ── Package ───────────────────────────────────────────────────
-      - name: Package binary
+      - name: Package binary (Unix)
+        if: runner.os != 'Windows'
         env:
           COMPAT: ${{ matrix.compat }}
           TARGET: ${{ matrix.target }}
@@ -206,6 +254,16 @@ jobs:
           zip "${GITHUB_WORKSPACE}/${ARCHIVE}" aptos
           echo "Packaged: ${ARCHIVE}"
 
+      - name: Package binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $Archive = "aptos-cli-${env:VERSION}-${env:TARGET}.zip"
+          Compress-Archive -Path "aptos-core\target\cli\aptos.exe" -DestinationPath $Archive
+          Write-Output "Packaged: ${Archive}"
+
       # ── Upload artifact ───────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -214,10 +272,11 @@ jobs:
           path: '*.zip'
 
   # ────────────────────────────────────────────────────────────────────
-  # Job 3: Create the GitHub Release with all artifacts
+  # Job 3: Create the GitHub Release with all artifacts (fresh releases)
   # ────────────────────────────────────────────────────────────────────
   release:
     needs: [check, build]
+    if: needs.check.outputs.should_build == 'true' && needs.check.outputs.backfill != 'true'
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.check.outputs.tag }}
@@ -293,6 +352,7 @@ jobs:
               *aarch64*linux*compat*)     PLATFORM="Linux ARM64 (compat, GLIBC 2.31+)" ;;
               *x86_64*linux*)             PLATFORM="Linux x86_64" ;;
               *aarch64*linux*)            PLATFORM="Linux ARM64" ;;
+              *x86_64*windows*)           PLATFORM="Windows x86_64" ;;
               *)                          PLATFORM="$zip" ;;
             esac
             echo "| $PLATFORM | \`$zip\` | \`$SHORT_HASH\` |" >> ../release_body.md
@@ -338,3 +398,75 @@ jobs:
           else
             echo "CHANGELOG.md unchanged, skipping commit"
           fi
+
+  # ────────────────────────────────────────────────────────────────────
+  # Job 4: Backfill — upload new artifacts to an existing release and
+  # merge their checksums into SHA256SUMS without touching anything else.
+  # ────────────────────────────────────────────────────────────────────
+  backfill:
+    needs: [check, build]
+    if: needs.check.outputs.should_build == 'true' && needs.check.outputs.backfill == 'true'
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      VERSION: ${{ needs.check.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download newly built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: new-artifacts
+          merge-multiple: true
+
+      - name: List new artifacts
+        run: ls -la new-artifacts/
+
+      - name: Download existing SHA256SUMS from release
+        run: |
+          mkdir -p existing
+          if gh release download "$TAG" --repo "$GH_REPO" --pattern "SHA256SUMS" --dir existing; then
+            echo "Found existing SHA256SUMS"
+          else
+            echo "No existing SHA256SUMS in release; will create one"
+            : > existing/SHA256SUMS
+          fi
+
+      - name: Merge checksums
+        run: |
+          set -euo pipefail
+          cd new-artifacts
+          # Generate checksums for the new (Windows) zips.
+          sha256sum aptos-cli-*.zip > new.sums
+
+          # Start with the existing checksums...
+          cp ../existing/SHA256SUMS merged.sums || : > merged.sums
+
+          # ...and replace any rows for files we are about to upload, then
+          # append the new ones. (`grep -v` removes existing entries with the
+          # same filename so we don't end up with duplicates.)
+          for f in aptos-cli-*.zip; do
+            grep -v "  $f\$" merged.sums > merged.sums.tmp || true
+            mv merged.sums.tmp merged.sums
+          done
+          cat new.sums >> merged.sums
+
+          # Stable, predictable ordering.
+          sort -k2 merged.sums -o merged.sums
+          mv merged.sums SHA256SUMS
+          echo "Merged SHA256SUMS:"
+          cat SHA256SUMS
+
+      - name: Upload artifacts to existing release
+        working-directory: new-artifacts
+        run: |
+          gh release upload "$TAG" \
+            --repo "$GH_REPO" \
+            --clobber \
+            aptos-cli-*.zip SHA256SUMS
+
+      - name: Summary
+        run: |
+          echo "Backfilled the following assets to $TAG:"
+          ls -1 new-artifacts/aptos-cli-*.zip
+          echo "Updated SHA256SUMS in the release."
