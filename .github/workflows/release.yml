@@ -16,7 +16,7 @@ on:
         default: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_INCREMENTAL: 0
@@ -149,10 +149,10 @@ jobs:
 
       # ── Checkout ──────────────────────────────────────────────────
       - name: Checkout release repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Checkout aptos-core
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: aptos-labs/aptos-core
           ref: ${{ needs.check.outputs.tag }}
@@ -194,20 +194,20 @@ jobs:
           echo "Using Rust toolchain: $CHANNEL"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ steps.rust-version.outputs.channel }}
           targets: ${{ matrix.target }}
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: aptos-core -> target
           key: ${{ matrix.target }}${{ matrix.compat && '-compat' || '' }}
 
       - name: Set up sccache (Shelby)
         if: '!matrix.container && runner.os != ''Windows'''
-        uses: gregnazario/shelby-sccache/action@main
+        uses: gregnazario/shelby-sccache/action@c2b4bdc8867e8fb00d99b3fd780755f1f0648d3c # main
         with:
           aptos-private-key: ${{ secrets.APTOS_PRIVATE_KEY }}
           shelby-api-key: ${{ secrets.SHELBY_API_KEY }}
@@ -266,7 +266,7 @@ jobs:
 
       # ── Upload artifact ───────────────────────────────────────────
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: aptos-cli-${{ matrix.target }}${{ matrix.compat && '-compat' || '' }}
           path: '*.zip'
@@ -278,15 +278,17 @@ jobs:
     needs: [check, build]
     if: needs.check.outputs.should_build == 'true' && needs.check.outputs.backfill != 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       TAG: ${{ needs.check.outputs.tag }}
       VERSION: ${{ needs.check.outputs.version }}
     steps:
       - name: Checkout release repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -377,7 +379,7 @@ jobs:
           fi
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ needs.check.outputs.tag }}
           name: Aptos CLI ${{ needs.check.outputs.version }}
@@ -407,6 +409,8 @@ jobs:
     needs: [check, build]
     if: needs.check.outputs.should_build == 'true' && needs.check.outputs.backfill == 'true'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       TAG: ${{ needs.check.outputs.tag }}
       VERSION: ${{ needs.check.outputs.version }}
@@ -414,7 +418,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Download newly built artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: new-artifacts
           merge-multiple: true
