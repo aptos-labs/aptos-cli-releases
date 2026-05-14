@@ -1,0 +1,48 @@
+name: Publish winget Package
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish-winget:
+    runs-on: windows-latest
+    if: "!github.event.release.prerelease"
+    steps:
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#aptos-cli-v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install wingetcreate
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://aka.ms/wingetcreate/latest -OutFile wingetcreate.exe
+
+      - name: Submit winget manifest update
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          WINGET_PAT: ${{ secrets.WINGET_GITHUB_PAT }}
+        run: |
+          $base = "https://github.com/aptos-labs/aptos-cli-releases/releases/download/aptos-cli-v${env:VERSION}"
+          $x64Url   = "$base/aptos-cli-${env:VERSION}-x86_64-pc-windows-msvc.zip"
+          $arm64Url = "$base/aptos-cli-${env:VERSION}-aarch64-pc-windows-msvc.zip"
+
+          # Only include the ARM64 URL if that asset actually exists on the release.
+          $urls = @($x64Url)
+          try {
+            $resp = Invoke-WebRequest -Uri $arm64Url -Method Head -ErrorAction Stop
+            if ($resp.StatusCode -eq 200) { $urls += $arm64Url }
+          } catch {
+            Write-Host "ARM64 Windows asset not present, submitting x86_64 only."
+          }
+
+          .\wingetcreate.exe update AptosLabs.AptosCLI `
+            --version $env:VERSION `
+            --urls $urls `
+            --submit `
+            --token $env:WINGET_PAT

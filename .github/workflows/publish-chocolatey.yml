@@ -1,0 +1,64 @@
+name: Publish Chocolatey Package
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish-chocolatey:
+    runs-on: windows-latest
+    if: "!github.event.release.prerelease"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#aptos-cli-v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download SHA256SUMS from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --pattern "SHA256SUMS" \
+            --dir .
+
+      - name: Parse Windows x86_64 checksum
+        id: checksums
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA256=$(grep "aptos-cli-${VERSION}-x86_64-pc-windows-msvc.zip$" SHA256SUMS | awk '{print $1}')
+          if [ -z "$SHA256" ]; then
+            echo "::error::No Windows x86_64 checksum found — Windows builds may not be available yet"
+            exit 1
+          fi
+          echo "sha256_x86_64=$SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Render nuspec and install script
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.checksums.outputs.sha256_x86_64 }}
+        run: |
+          sed \
+            -e "s/{{VERSION}}/${VERSION}/g" \
+            packaging/chocolatey/aptos-cli.nuspec.template > packaging/chocolatey/aptos-cli.nuspec
+
+          sed \
+            -e "s/{{VERSION}}/${VERSION}/g" \
+            -e "s/{{SHA256}}/${SHA256}/g" \
+            packaging/chocolatey/tools/chocolateyinstall.ps1.template > packaging/chocolatey/tools/chocolateyinstall.ps1
+
+      - name: Pack and push to Chocolatey
+        shell: pwsh
+        run: |
+          cd packaging/chocolatey
+          choco pack aptos-cli.nuspec
+          choco push aptos-cli.${{ steps.version.outputs.version }}.nupkg --source https://push.chocolatey.org/ --api-key ${{ secrets.CHOCOLATEY_API_KEY }}

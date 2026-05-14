@@ -1,0 +1,116 @@
+name: Publish Nix Package
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish-nix:
+    runs-on: ubuntu-latest
+    if: "!github.event.release.prerelease"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#aptos-cli-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download SHA256SUMS from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ steps.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "SHA256SUMS" \
+            --dir .
+
+      - name: Parse checksums
+        id: checksums
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sha_x86_linux=$(grep "aptos-cli-${VERSION}-x86_64-unknown-linux-gnu.zip$" SHA256SUMS | awk '{print $1}')
+          sha_arm_linux=$(grep "aptos-cli-${VERSION}-aarch64-unknown-linux-gnu.zip$" SHA256SUMS | awk '{print $1}')
+          sha_x86_mac=$(grep "aptos-cli-${VERSION}-x86_64-apple-darwin.zip$" SHA256SUMS | awk '{print $1}')
+          sha_arm_mac=$(grep "aptos-cli-${VERSION}-aarch64-apple-darwin.zip$" SHA256SUMS | awk '{print $1}')
+
+          for name in sha_x86_linux sha_arm_linux sha_x86_mac sha_arm_mac; do
+            val="${!name}"
+            if [ -z "$val" ]; then
+              echo "::error::Missing checksum for $name"
+              exit 1
+            fi
+            echo "$name=$val" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Render Nix derivation
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA_X86_LINUX: ${{ steps.checksums.outputs.sha_x86_linux }}
+          SHA_ARM_LINUX: ${{ steps.checksums.outputs.sha_arm_linux }}
+          SHA_X86_MAC: ${{ steps.checksums.outputs.sha_x86_mac }}
+          SHA_ARM_MAC: ${{ steps.checksums.outputs.sha_arm_mac }}
+        run: |
+          sed \
+            -e "s/{{VERSION}}/${VERSION}/g" \
+            -e "s/{{SHA256_X86_64_LINUX}}/${SHA_X86_LINUX}/g" \
+            -e "s/{{SHA256_AARCH64_LINUX}}/${SHA_ARM_LINUX}/g" \
+            -e "s/{{SHA256_X86_64_DARWIN}}/${SHA_X86_MAC}/g" \
+            -e "s/{{SHA256_AARCH64_DARWIN}}/${SHA_ARM_MAC}/g" \
+            packaging/nix/aptos-cli-bin.nix.template > aptos-cli-bin.nix
+
+          echo "Generated Nix derivation:"
+          cat aptos-cli-bin.nix
+
+      - name: Fork and submit PR to nixpkgs
+        env:
+          NIXPKGS_PAT: ${{ secrets.NIXPKGS_GITHUB_PAT }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Configure git
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Clone nixpkgs (shallow)
+          gh repo clone NixOS/nixpkgs nixpkgs -- --depth=1
+          cd nixpkgs
+
+          # Create branch
+          BRANCH="aptos-cli-bin-${VERSION}"
+          git checkout -b "$BRANCH"
+
+          # Place the derivation
+          mkdir -p pkgs/by-name/ap/aptos-cli-bin
+          cp ../aptos-cli-bin.nix pkgs/by-name/ap/aptos-cli-bin/package.nix
+
+          # Commit and push
+          git add pkgs/by-name/ap/aptos-cli-bin/package.nix
+          git commit -m "aptos-cli-bin: ${VERSION}"
+
+          # Push to fork and create PR
+          gh auth login --with-token <<< "$NIXPKGS_PAT"
+
+          # Ensure fork exists
+          gh repo fork NixOS/nixpkgs --clone=false 2>/dev/null || true
+          FORK_OWNER=$(gh api user --jq .login)
+          git remote add fork "https://x-access-token:${NIXPKGS_PAT}@github.com/${FORK_OWNER}/nixpkgs.git"
+          git push fork "$BRANCH" --force
+
+          # Create PR
+          gh pr create \
+            --repo NixOS/nixpkgs \
+            --base master \
+            --head "${FORK_OWNER}:${BRANCH}" \
+            --title "aptos-cli-bin: init at ${VERSION}" \
+            --body "Automated update from [aptos-cli-releases](https://github.com/aptos-labs/aptos-cli-releases/releases/tag/aptos-cli-v${VERSION}).
+
+          Pre-built binary package for the Aptos CLI.
+
+          ## Metadata
+          - Version: ${VERSION}
+          - License: Apache-2.0
+          - Platforms: x86_64-linux, aarch64-linux, x86_64-darwin, aarch64-darwin"

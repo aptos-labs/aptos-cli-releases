@@ -149,10 +149,10 @@ jobs:
 
       # ── Checkout ──────────────────────────────────────────────────
       - name: Checkout release repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Checkout aptos-core
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: aptos-labs/aptos-core
           ref: ${{ needs.check.outputs.tag }}
@@ -266,7 +266,7 @@ jobs:
 
       # ── Upload artifact ───────────────────────────────────────────
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aptos-cli-${{ matrix.target }}${{ matrix.compat && '-compat' || '' }}
           path: '*.zip'
@@ -283,10 +283,10 @@ jobs:
       VERSION: ${{ needs.check.outputs.version }}
     steps:
       - name: Checkout release repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -414,7 +414,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - name: Download newly built artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: new-artifacts
           merge-multiple: true

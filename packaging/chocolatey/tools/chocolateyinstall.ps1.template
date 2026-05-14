@@ -1,0 +1,11 @@
+$ErrorActionPreference = 'Stop'
+
+$packageArgs = @{
+  packageName    = 'aptos-cli'
+  url64bit       = 'https://github.com/aptos-labs/aptos-cli-releases/releases/download/aptos-cli-v{{VERSION}}/aptos-cli-{{VERSION}}-x86_64-pc-windows-msvc.zip'
+  checksum64     = '{{SHA256}}'
+  checksumType64 = 'sha256'
+  unzipLocation  = "$(Split-Path -Parent $MyInvocation.MyCommand.Definition)"
+}
+
+Install-ChocolateyZipPackage @packageArgs

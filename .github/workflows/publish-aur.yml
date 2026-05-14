@@ -1,0 +1,104 @@
+name: Publish AUR Package
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish-aur:
+    runs-on: ubuntu-latest
+    if: "!github.event.release.prerelease"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#aptos-cli-v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Download SHA256SUMS from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ github.event.release.tag_name }}" \
+            --pattern "SHA256SUMS" \
+            --dir .
+
+      - name: Parse checksums
+        id: checksums
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA256_X86_64=$(grep "aptos-cli-${VERSION}-x86_64-unknown-linux-gnu.zip$" SHA256SUMS | awk '{print $1}')
+          SHA256_AARCH64=$(grep "aptos-cli-${VERSION}-aarch64-unknown-linux-gnu.zip$" SHA256SUMS | awk '{print $1}')
+
+          if [ -z "$SHA256_X86_64" ] || [ -z "$SHA256_AARCH64" ]; then
+            echo "Error: Could not parse checksums from SHA256SUMS"
+            cat SHA256SUMS
+            exit 1
+          fi
+
+          echo "sha256_x86_64=${SHA256_X86_64}" >> "$GITHUB_OUTPUT"
+          echo "sha256_aarch64=${SHA256_AARCH64}" >> "$GITHUB_OUTPUT"
+
+      - name: Render PKGBUILD
+        run: |
+          sed \
+            -e 's/{{VERSION}}/${{ steps.version.outputs.version }}/g' \
+            -e 's/{{SHA256_X86_64}}/${{ steps.checksums.outputs.sha256_x86_64 }}/g' \
+            -e 's/{{SHA256_AARCH64}}/${{ steps.checksums.outputs.sha256_aarch64 }}/g' \
+            packaging/aur/PKGBUILD.template > PKGBUILD
+
+      - name: Generate .SRCINFO
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          SHA256_X86_64="${{ steps.checksums.outputs.sha256_x86_64 }}"
+          SHA256_AARCH64="${{ steps.checksums.outputs.sha256_aarch64 }}"
+
+          cat > .SRCINFO << EOF
+          pkgbase = aptos-bin
+          $(printf '\t')pkgdesc = CLI for the Aptos blockchain
+          $(printf '\t')pkgver = ${VERSION}
+          $(printf '\t')pkgrel = 1
+          $(printf '\t')url = https://github.com/aptos-labs/aptos-cli-releases
+          $(printf '\t')arch = x86_64
+          $(printf '\t')arch = aarch64
+          $(printf '\t')license = Apache-2.0
+          $(printf '\t')provides = aptos
+          $(printf '\t')conflicts = aptos
+          $(printf '\t')source_x86_64 = https://github.com/aptos-labs/aptos-cli-releases/releases/download/aptos-cli-v${VERSION}/aptos-cli-${VERSION}-x86_64-unknown-linux-gnu.zip
+          $(printf '\t')sha256sums_x86_64 = ${SHA256_X86_64}
+          $(printf '\t')source_aarch64 = https://github.com/aptos-labs/aptos-cli-releases/releases/download/aptos-cli-v${VERSION}/aptos-cli-${VERSION}-aarch64-unknown-linux-gnu.zip
+          $(printf '\t')sha256sums_aarch64 = ${SHA256_AARCH64}
+
+          pkgname = aptos-bin
+          EOF
+          # Remove leading whitespace from YAML indentation
+          sed -i 's/^          //' .SRCINFO
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AUR_SSH_PRIVATE_KEY }}" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config << EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          EOF
+
+      - name: Clone AUR repo and publish
+        run: |
+          git clone ssh://aur@aur.archlinux.org/aptos-bin.git aur-repo
+          cp PKGBUILD aur-repo/PKGBUILD
+          cp .SRCINFO aur-repo/.SRCINFO
+          cd aur-repo
+          git config user.name "Aptos Labs"
+          git config user.email "opensource@aptoslabs.com"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Update to v${{ steps.version.outputs.version }}"
+          git push

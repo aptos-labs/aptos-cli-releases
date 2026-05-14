@@ -1,0 +1,122 @@
+name: Publish Scoop Bucket
+
+on:
+  release:
+    types: [published]
+
+env:
+  BUCKET_REPO: aptos-labs/scoop-aptos
+
+jobs:
+  publish-scoop:
+    runs-on: ubuntu-latest
+    if: "!github.event.release.prerelease"
+    steps:
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#aptos-cli-v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Download SHA256SUMS from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ steps.version.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "SHA256SUMS" \
+            --dir .
+
+      - name: Parse Windows checksums
+        id: checksums
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sha_x86=$(grep "aptos-cli-${VERSION}-x86_64-pc-windows-msvc.zip$" SHA256SUMS | awk '{print $1}')
+          sha_arm=$(grep "aptos-cli-${VERSION}-aarch64-pc-windows-msvc.zip$" SHA256SUMS | awk '{print $1}')
+
+          if [ -z "$sha_x86" ]; then
+            echo "::error::No Windows x86_64 checksum found — Windows builds may not be available yet"
+            exit 1
+          fi
+
+          echo "sha_x86=$sha_x86" >> "$GITHUB_OUTPUT"
+          echo "sha_arm=${sha_arm:-}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Scoop manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA_X86: ${{ steps.checksums.outputs.sha_x86 }}
+          SHA_ARM: ${{ steps.checksums.outputs.sha_arm }}
+        run: |
+          mkdir -p bucket
+
+          # Build architecture array — include ARM only if we have a checksum
+          if [ -n "$SHA_ARM" ]; then
+            ARM_BLOCK=$(cat << ARMEOF
+        "arm64": {
+            "url": "https://github.com/aptos-labs/aptos-cli-releases/releases/download/aptos-cli-v${VERSION}/aptos-cli-${VERSION}-aarch64-pc-windows-msvc.zip",
+            "hash": "${SHA_ARM}"
+        }
+ARMEOF
+          )
+          else
+            ARM_BLOCK=""
+          fi
+
+          cat > bucket/aptos-cli.json << MANIFEST
+          {
+              "version": "${VERSION}",
+              "description": "CLI for the Aptos blockchain",
+              "homepage": "https://github.com/aptos-labs/aptos-cli-releases",
+              "license": "Apache-2.0",
+              "architecture": {
+                  "64bit": {
+                      "url": "https://github.com/aptos-labs/aptos-cli-releases/releases/download/aptos-cli-v${VERSION}/aptos-cli-${VERSION}-x86_64-pc-windows-msvc.zip",
+                      "hash": "${SHA_X86}"
+                  }${ARM_BLOCK:+,
+                  ${ARM_BLOCK}}
+              },
+              "bin": "aptos.exe",
+              "checkver": {
+                  "github": "https://github.com/aptos-labs/aptos-cli-releases",
+                  "regex": "aptos-cli-v([\\\\d.]+)"
+              },
+              "autoupdate": {
+                  "architecture": {
+                      "64bit": {
+                          "url": "https://github.com/aptos-labs/aptos-cli-releases/releases/download/aptos-cli-v\$version/aptos-cli-\$version-x86_64-pc-windows-msvc.zip"
+                      },
+                      "arm64": {
+                          "url": "https://github.com/aptos-labs/aptos-cli-releases/releases/download/aptos-cli-v\$version/aptos-cli-\$version-aarch64-pc-windows-msvc.zip"
+                      }
+                  }
+              }
+          }
+          MANIFEST
+
+          # Remove leading whitespace from YAML indentation
+          sed -i 's/^          //' bucket/aptos-cli.json
+          echo "Generated Scoop manifest:"
+          cat bucket/aptos-cli.json
+
+      - name: Push manifest to bucket repo
+        env:
+          BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git clone "https://x-access-token:${BUCKET_TOKEN}@github.com/${BUCKET_REPO}.git" scoop-repo
+          mkdir -p scoop-repo/bucket
+          cp bucket/aptos-cli.json scoop-repo/bucket/aptos-cli.json
+
+          cd scoop-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/aptos-cli.json
+          if git diff --cached --quiet; then
+            echo "Manifest unchanged, nothing to push"
+          else
+            git commit -m "Update aptos-cli to ${VERSION}"
+            git push
+          fi

@@ -1,0 +1,91 @@
+name: 'Setup Aptos CLI'
+description: 'Download and install the Aptos CLI for use in GitHub Actions workflows'
+branding:
+  icon: 'terminal'
+  color: 'green'
+
+inputs:
+  version:
+    description: 'Aptos CLI version to install (e.g., "9.0.0"). Defaults to "latest".'
+    required: false
+    default: 'latest'
+
+outputs:
+  version:
+    description: 'The version of Aptos CLI that was installed'
+    value: ${{ steps.install.outputs.version }}
+  path:
+    description: 'Path to the installed aptos binary'
+    value: ${{ steps.install.outputs.path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Determine version and platform
+      id: resolve
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        # Resolve version
+        if [ "$INPUT_VERSION" = "latest" ]; then
+          TAG=$(gh api repos/aptos-labs/aptos-cli-releases/releases/latest --jq .tag_name)
+          VERSION="${TAG#aptos-cli-v}"
+        else
+          VERSION="$INPUT_VERSION"
+          TAG="aptos-cli-v${VERSION}"
+        fi
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+        # Determine target triple
+        OS=$(uname -s)
+        ARCH=$(uname -m)
+        case "$OS-$ARCH" in
+          Linux-x86_64)   TARGET="x86_64-unknown-linux-gnu" ;;
+          Linux-aarch64)  TARGET="aarch64-unknown-linux-gnu" ;;
+          Darwin-x86_64)  TARGET="x86_64-apple-darwin" ;;
+          Darwin-arm64)   TARGET="aarch64-apple-darwin" ;;
+          MINGW*-x86_64|MSYS*-x86_64)  TARGET="x86_64-pc-windows-msvc" ;;
+          MINGW*-aarch64|MSYS*-aarch64) TARGET="aarch64-pc-windows-msvc" ;;
+          *) echo "::error::Unsupported platform: $OS $ARCH"; exit 1 ;;
+        esac
+        echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+    - name: Download and install
+      id: install
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        VERSION: ${{ steps.resolve.outputs.version }}
+        TAG: ${{ steps.resolve.outputs.tag }}
+        TARGET: ${{ steps.resolve.outputs.target }}
+      run: |
+        ARCHIVE="aptos-cli-${VERSION}-${TARGET}.zip"
+        INSTALL_DIR="${RUNNER_TOOL_CACHE}/aptos/${VERSION}"
+        mkdir -p "$INSTALL_DIR"
+
+        echo "Downloading Aptos CLI ${VERSION} for ${TARGET}..."
+        gh release download "$TAG" \
+          --repo aptos-labs/aptos-cli-releases \
+          --pattern "$ARCHIVE" \
+          --dir "$INSTALL_DIR"
+
+        cd "$INSTALL_DIR"
+        unzip -o "$ARCHIVE"
+        rm "$ARCHIVE"
+        chmod +x aptos* 2>/dev/null || true
+
+        # Add to PATH
+        echo "$INSTALL_DIR" >> "$GITHUB_PATH"
+
+        # Set outputs
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "path=$INSTALL_DIR/aptos" >> "$GITHUB_OUTPUT"
+
+    - name: Verify installation
+      shell: bash
+      run: |
+        echo "Installed Aptos CLI:"
+        aptos --version
